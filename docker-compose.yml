@@ -1,0 +1,22 @@
+services:
+  streamwall:
+    build: .
+    container_name: streamwall
+    ports:
+      - "8080:8080"
+    volumes:
+      # Point the left side at your media folder on the server
+      - ./media:/media
+      # Persists saved streams + wall state across restarts
+      - ./data:/data
+    # Secrets are NOT stored in this file. Docker Compose reads them from a
+    # ".env" file next to this one (never committed — see .gitignore).
+    # Copy .env.example to .env on the server and fill in your values.
+    environment:
+      # PandaScore API key (pandascore.co) — required for PS widgets
+      - PANDASCORE_TOKEN=${PANDASCORE_TOKEN:-}
+      # Twitch "auth-token" cookie (optional) — ad-free on subs, followed list
+      - TWITCH_AUTH_TOKEN=${TWITCH_AUTH_TOKEN:-}
+      # YouTube account (optional): no env var — save exported youtube.com
+      # cookies as ./data/youtube-cookies.txt (data/ is never committed).
+    restart: unless-stopped

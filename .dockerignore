@@ -1,0 +1,8 @@
+# Keep secrets, runtime data and media out of the image build context
+.env
+.env.*
+data/
+media/
+node_modules/
+.git/
+*cookies*.txt

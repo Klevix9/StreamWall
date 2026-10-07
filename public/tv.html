@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StreamWall TV</title>
+<!-- Load hls.js from our own server first (works with no external internet on
+     the TV); fall back to the CDN only if the local copy fails to load. -->
+<script src="/vendor/hls.min.js"></script>
+<script>
+  if (!window.Hls) {
+    document.write('<scr' + 'ipt src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js"><\/scr' + 'ipt>');
+  }
+</script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  #wall { display: grid; width: 100vw; height: 100vh; gap: 2px; background: #000; }
+  .slot { position: relative; background: #0a0a0a; overflow: hidden; display: none; }
+  .slot video, .slot iframe { width: 100%; height: 100%; border: 0; object-fit: contain; background: #000; }
+  .slot .empty {
+    position: absolute; inset: 0; display: flex; flex-direction: column; gap: 1.2vw;
+    align-items: center; justify-content: center; color: #3a3f4d;
+    font: 600 2vw system-ui, sans-serif; letter-spacing: .2em; z-index: 2;
+    background: radial-gradient(ellipse at center, #11141c 0%, #07080b 75%);
+  }
+  .slot .empty.msg { color: #aab2c5; background: radial-gradient(ellipse at center, rgba(17,20,28,.85) 0%, rgba(7,8,11,.92) 75%); }
+  .spinner {
+    width: 3vw; height: 3vw; min-width: 28px; min-height: 28px; border-radius: 50%;
+    border: .3vw solid rgba(255,255,255,.08); border-top-color: #8b7cff; animation: spin .9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* channel OSD (shown briefly when a screen changes) */
+  .osd {
+    position: absolute; left: 2.2%; bottom: 3.5%; z-index: 6; max-width: 70%;
+    display: flex; align-items: center; gap: 1vw; padding: .9vw 1.4vw .9vw 1vw;
+    background: rgba(8,10,16,.78); backdrop-filter: blur(10px); border-radius: 1vw;
+    border: 1px solid rgba(255,255,255,.12); color: #fff; font-family: system-ui, sans-serif;
+    box-shadow: 0 1vw 3vw rgba(0,0,0,.5);
+    animation: osdIn .45s cubic-bezier(.2,.9,.25,1.15); transition: opacity .6s, transform .6s;
+  }
+  .osd.out { opacity: 0; transform: translateY(1vw); }
+  .osd .n { width: 2.6vw; height: 2.6vw; border-radius: .6vw; display: grid; place-items: center; font-weight: 800; font-size: 1.3vw;
+            background: linear-gradient(135deg, #6d7cff, #a46bff); flex-shrink: 0; }
+  .osd .k { font-size: .8vw; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; opacity: .7; }
+  .osd .t { font-size: 1.5vw; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @keyframes osdIn { from { opacity: 0; transform: translateY(1.5vw) scale(.97); } }
+
+  /* identify overlay */
+  .ident {
+    position: absolute; inset: 0; z-index: 8; display: grid; place-items: center;
+    background: rgba(10,12,20,.55); border: .4vw solid #8b7cff; animation: osdIn .3s;
+    font: 900 14vmin system-ui, sans-serif; color: #fff; text-shadow: 0 .5vw 3vw rgba(0,0,0,.8);
+    transition: opacity .5s;
+  }
+  .ident.out { opacity: 0; }
+  .slot .audio-badge {
+    position: absolute; top: 12px; right: 12px; color: #fff; opacity: .55;
+    font: 700 16px system-ui; background: rgba(0,0,0,.5); border-radius: 6px;
+    padding: 4px 8px; display: none;
+  }
+  .slot.has-audio .audio-badge { display: block; }
+
+  /* layouts */
+  .layout-single       { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  .layout-split-h      { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; }
+  .layout-split-v      { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .layout-one-plus-two { grid-template-columns: 2fr 1fr; grid-template-rows: 1fr 1fr; }
+  .layout-one-plus-two #slot0 { grid-row: 1 / 3; }
+  .layout-grid         { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .layout-free         { display: block; position: relative; }
+  .layout-free .slot   { position: absolute; border-radius: 6px; }
+
+  #connDot {
+    position: fixed; bottom: 10px; right: 10px; width: 10px; height: 10px;
+    border-radius: 50%; background: #e33; z-index: 40; opacity: .8;
+  }
+  #connDot.ok { display: none; }
+
+  /* widgets overlay */
+  #widgets { position: fixed; inset: 0; z-index: 30; pointer-events: none; font-family: system-ui, sans-serif; }
+  .widget {
+    position: absolute; transform: translate(-50%, -50%);
+    background: linear-gradient(160deg, rgba(22,25,38,.86), rgba(8,10,16,.82)); color: #fff; border-radius: 1vw;
+    border: 1px solid rgba(255,255,255,.13); padding: 1vw 1.6vw;
+    backdrop-filter: blur(12px); max-width: 36vw;
+    box-shadow: 0 1vw 3vw rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
+  }
+  .widget .wt {
+    font-size: 1vw; color: #a9a2ff; text-transform: uppercase;
+    letter-spacing: .12em; margin-bottom: .3vw; font-weight: 600;
+  }
+  .widget .wb { font-size: 1.6vw; font-weight: 600; white-space: pre-line; line-height: 1.35; }
+  .widget.clock .wb { font-size: 3vw; font-variant-numeric: tabular-nums; font-weight: 700; }
+  .widget.score .row { display: flex; align-items: center; gap: 1.4vw; }
+  .widget.score .team { text-align: center; min-width: 6vw; }
+  .widget.score .team b { display: block; font-size: 1.2vw; margin-bottom: .2vw; }
+  .widget.score .team span { font-size: 2.8vw; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .widget.score .vs { color: #9fb0c8; font-size: 1.1vw; font-weight: 600; }
+  .widget .wl { font-size: 1.15vw; color: #c9d4e4; font-weight: 500; line-height: 1.5; }
+  .widget .csbig { font-size: 1.7vw; font-weight: 700; margin-bottom: .3vw; }
+  .widget .csbig b { color: #4f8cff; font-variant-numeric: tabular-nums; }
+  .widget .live { color: #ff5a5a; font-weight: 700; }
+  /* PandaScore widgets */
+  .widget.pslive .ps-match { margin-bottom: .6vw; padding-bottom: .6vw; border-bottom: 1px solid rgba(255,255,255,.1); }
+  .widget.pslive .ps-match:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+  .widget.pslive .ps-row { display: flex; align-items: center; gap: .8vw; margin-bottom: .15vw; }
+  .widget.pslive .ps-team { font-size: 1.4vw; font-weight: 700; min-width: 5vw; }
+  .widget.pslive .ps-score { font-size: 2.2vw; font-weight: 800; font-variant-numeric: tabular-nums; color: #4f8cff; }
+  .widget.pslive .ps-sep { font-size: 1.2vw; color: #9fb0c8; }
+  .widget.pslive .ps-meta { font-size: .9vw; color: #9fb0c8; }
+  .widget.psticker .tick-row { display: flex; justify-content: space-between; align-items: baseline; gap: 1vw; padding: .3vw 0; border-bottom: 1px solid rgba(255,255,255,.07); }
+  .widget.psticker .tick-row:last-child { border-bottom: none; }
+  .widget.psticker .tick-teams { font-size: 1.15vw; font-weight: 700; }
+  .widget.psticker .tick-meta { font-size: .95vw; color: #9fb0c8; white-space: nowrap; }
+  .widget.pstournament .t-item { margin-bottom: .5vw; }
+  .widget.pstournament .t-name { font-size: 1.3vw; font-weight: 700; }
+  .widget.pstournament .t-meta { font-size: .95vw; color: #9fb0c8; }
+</style>
+</head>
+<body>
+<div id="wall" class="layout-single">
+  <div class="slot" id="slot0"><div class="empty">1</div><div class="audio-badge">&#128266;</div></div>
+  <div class="slot" id="slot1"><div class="empty">2</div><div class="audio-badge">&#128266;</div></div>
+  <div class="slot" id="slot2"><div class="empty">3</div><div class="audio-badge">&#128266;</div></div>
+  <div class="slot" id="slot3"><div class="empty">4</div><div class="audio-badge">&#128266;</div></div>
+</div>
+<div id="widgets"></div>
+<div id="connDot"></div>
+
+<script>
+const VISIBLE = { 'single': 1, 'split-h': 2, 'split-v': 2, 'one-plus-two': 3, 'grid': 4, 'free': 4 };
+let state = null;
+let rendered = [null, null, null, null];   // JSON of source rendered per slot
+let hlsInstances = [null, null, null, null];
+let lastSrcKey = [null, null, null, null];  // for OSD: only announce real changes
+let soundOn = false;
+
+// Enable sound automatically 5s after the page finishes loading. On the TV
+// (Chromium kiosk with --autoplay-policy=no-user-gesture-required) this plays
+// with sound on its own. Any tap/click/keypress also enables it immediately,
+// which covers ordinary browsers that still require a user gesture.
+function enableSound() {
+  if (soundOn) return;
+  soundOn = true;
+  applyAudioAndPlayback();
+}
+window.addEventListener('load', () => setTimeout(enableSound, 5000));
+['click', 'keydown', 'touchstart'].forEach(ev =>
+  window.addEventListener(ev, enableSound, { once: true }));
+
+// ---------- source classification ----------
+function ytId(url) {
+  const m = url.match(/(?:youtube\.com\/(?:watch\?.*v=|live\/|shorts\/|embed\/)|youtu\.be\/)([\w-]{6,})/);
+  return m ? m[1] : null;
+}
+function twitchChannel(url) {
+  const m = url.match(/twitch\.tv\/(?!videos\/)([\w]+)/);
+  return m ? m[1] : null;
+}
+function twitchVideo(url) {
+  const m = url.match(/twitch\.tv\/videos\/(\d+)/);
+  return m ? m[1] : null;
+}
+function isEmbed(url) { return !!(ytId(url) || twitchChannel(url) || twitchVideo(url)); }
+function isHls(url) { return /\.m3u8(\?|$)/i.test(url); }
+
+// ---------- rendering ----------
+function clearSlot(i) {
+  if (hlsInstances[i]) { try { hlsInstances[i].destroy(); } catch {} hlsInstances[i] = null; }
+  const el = document.getElementById('slot' + i);
+  el.querySelectorAll('video, iframe, .sndblk').forEach(n => n.remove());
+}
+
+function renderSlot(i, force) {
+  const src = state.slots[i].source;
+  // quality is part of the render key so changing it reloads the stream
+  const key = JSON.stringify(src) + '|' + (state.slots[i].quality || 'best');
+  if (!force && key === rendered[i]) return;
+  const srcKey = JSON.stringify(src);
+  const changed = !force && srcKey !== lastSrcKey[i];
+  lastSrcKey[i] = srcKey;
+  rendered[i] = key;
+  clearSlot(i);
+  const el = document.getElementById('slot' + i);
+  setMsg(el, src ? null : String(i + 1));
+  if (!src) { showOsd(i, null); return; }
+  if (changed) showOsd(i, src);
+
+  const url = src.url;
+  const hasAudio = soundOn && !state.muted && (Number(state.slots[i].volume) || 0) > 0;
+
+  const yid = ytId(url);
+  const tCh = twitchChannel(url);
+  const tVid = twitchVideo(url);
+
+  if (yid) {
+    // Preferred: resolve via yt-dlp server-side (plays as your account when a
+    // cookies file is configured — members-only/age-restricted work, watch
+    // history is recorded) and play natively like Twitch. Falls back to the
+    // classic iframe embed if resolution fails.
+    setMsg(el, 'Loading YouTube…');
+    fetch('/api/resolve/youtube?id=' + encodeURIComponent(yid))
+      .then(r => r.json())
+      .then(j => {
+        if (rendered[i] !== key) return; // slot changed while loading
+        if (!j.url) throw new Error(j.error || 'unavailable');
+        setMsg(el, null);
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.playsInline = true;
+        video.muted = !hasAudio;
+        el.appendChild(video);
+        if (j.kind === 'hls') attachHls(video, j.url, i);
+        else video.src = '/api/hls?url=' + encodeURIComponent(j.url);
+        applyAudioAndPlayback();
+        if (state.playing && !state.slots[i].paused) video.play().catch(() => {});
+      })
+      .catch(() => {
+        if (rendered[i] !== key) return;
+        setMsg(el, null);
+        embedYouTube(el, yid); // fallback: iframe embed
+      });
+  } else if (tCh || tVid) {
+    // played as direct HLS (resolved server-side) — full audio control, no embed limits
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = !hasAudio;
+    el.appendChild(video);
+    setMsg(el, 'Loading Twitch…');
+    fetch('/api/resolve/twitch?' + (tVid ? 'vod=' + encodeURIComponent(tVid) : 'channel=' + encodeURIComponent(tCh)) +
+          '&quality=' + encodeURIComponent(state.slots[i].quality || 'best'))
+      .then(r => r.json())
+      .then(j => {
+        if (rendered[i] !== key) return; // slot changed while loading
+        if (!j.url) { setMsg(el, 'Twitch: ' + (j.error || 'unavailable')); return; }
+        setMsg(el, null);
+        attachHls(video, j.url, i);
+        if (state.playing && !state.slots[i].paused) video.play().catch(() => {});
+      })
+      .catch(e => setMsg(el, 'Twitch: ' + e.message));
+  } else {
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = !hasAudio;
+    if (src.type === 'file' || !isHls(url)) {
+      if (isHls(url)) attachHls(video, url, i);
+      else video.src = url;
+      if (src.type === 'file') { video.loop = false; }
+    } else {
+      attachHls(video, url, i);
+    }
+    el.appendChild(video);
+    if (state.playing && !state.slots[i].paused) video.play().catch(() => {});
+  }
+}
+
+function attachHls(video, url, i) {
+  // The TV may have no direct internet access, so remote HLS (Twitch CDN,
+  // external m3u8s) is fetched via the server's /api/hls proxy. Local/relative
+  // URLs (e.g. /media files) pass through untouched.
+  if (/^https?:\/\//i.test(url) && !url.startsWith(location.origin)) {
+    url = '/api/hls?url=' + encodeURIComponent(url);
+  }
+  const el = document.getElementById('slot' + i);
+  // clear the loading/overlay message once the picture actually starts
+  video.addEventListener('playing', () => setMsg(el, null));
+  if (window.Hls && Hls.isSupported()) {
+    // Sit ~12s behind the live edge with a fat buffer: every fetch hops through
+    // the /api/hls proxy, so playing 2-3 segments from the edge (hls.js default)
+    // stalls on any jitter. The extra delay is invisible on a video wall.
+    const hls = new Hls({
+      liveDurationInfinity: true,
+      lowLatencyMode: false,
+      liveSyncDurationCount: 6,        // target: 6 segments (~12s) behind live
+      liveMaxLatencyDurationCount: 14, // only seek forward if we fall >28s behind
+      maxBufferLength: 30,
+      backBufferLength: 30,
+      fragLoadingMaxRetry: 8,
+      manifestLoadingMaxRetry: 8,
+      levelLoadingMaxRetry: 8,
+      fragLoadingRetryDelay: 500,
+      manifestLoadingRetryDelay: 500
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      if (state.playing && !state.slots[i].paused) video.play().catch(() => {});
+    });
+    let net = 0;
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        if (++net <= 3) { setMsg(el, 'Reconnecting… (' + (data.details || 'network') + ')'); setTimeout(() => hls.startLoad(), 3000); }
+        else { setMsg(el, 'Stream unreachable: ' + (data.details || 'network error')); }
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+      } else {
+        setMsg(el, 'Stream error: ' + (data.details || data.type));
+        hls.destroy(); setTimeout(() => renderSlot(i, true), 8000);
+      }
+    });
+    hlsInstances[i] = hls;
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = url; // native HLS (Safari / iOS)
+  } else {
+    // hls.js failed to load AND the browser has no native HLS — the usual
+    // cause of a silent black screen on TV browsers. Say so plainly.
+    setMsg(el, 'Cannot play HLS here — video engine failed to load. Check the TV’s internet / reload.');
+  }
+}
+
+function embedYouTube(el, yid) {
+  // classic iframe embed; audio + play/pause controlled via the iframe API
+  const f = addIframe(el, 'https://www.youtube.com/embed/' + yid +
+    '?autoplay=1&controls=0&rel=0&playsinline=1&mute=1&enablejsapi=1');
+  f.dataset.yt = '1';
+  f.addEventListener('load', () => setTimeout(applyAudioAndPlayback, 1500));
+}
+
+function addIframe(el, src) {
+  const f = document.createElement('iframe');
+  f.src = src;
+  f.allow = 'autoplay; encrypted-media; fullscreen';
+  el.appendChild(f);
+  return f;
+}
+
+function setMsg(el, text) {
+  const m = el.querySelector('.empty');
+  m.style.display = text ? 'flex' : 'none';
+  m.textContent = '';
+  // single digit → big placeholder; longer text → readable message
+  const longMsg = text && text.length > 2;
+  m.classList.toggle('msg', !!longMsg);
+  m.style.font = longMsg ? '500 1.3vw system-ui, sans-serif' : '700 4vw system-ui, sans-serif';
+  m.style.letterSpacing = longMsg ? 'normal' : '.1em';
+  m.style.padding = longMsg ? '0 6%' : '0';
+  m.style.textAlign = 'center';
+  if (!text) return;
+  // transient states get a spinner
+  if (/^(Loading|Reconnecting)/.test(text)) m.insertAdjacentHTML('beforeend', '<div class="spinner"></div>');
+  const s = document.createElement('div');
+  s.textContent = text;
+  m.appendChild(s);
+}
+
+// ---------- OSD: briefly show what just started on a screen ----------
+function kindOf(url) {
+  if (/twitch\.tv\//i.test(url)) return 'Twitch';
+  if (/youtu\.?be/i.test(url)) return 'YouTube';
+  if (String(url).startsWith('/media/')) return 'Library';
+  return 'Stream';
+}
+function showOsd(i, src) {
+  const el = document.getElementById('slot' + i);
+  el.querySelectorAll('.osd').forEach(n => n.remove());
+  if (!src) return;
+  const o = document.createElement('div');
+  o.className = 'osd';
+  o.innerHTML = '<div class="n">' + (i + 1) + '</div><div style="min-width:0"><div class="k"></div><div class="t"></div></div>';
+  o.querySelector('.k').textContent = kindOf(src.url);
+  o.querySelector('.t').textContent = src.name || src.url;
+  el.appendChild(o);
+  setTimeout(() => o.classList.add('out'), 5000);
+  setTimeout(() => o.remove(), 5700);
+}
+
+// ---------- identify: big screen numbers for a few seconds ----------
+function identify() {
+  for (let i = 0; i < 4; i++) {
+    const el = document.getElementById('slot' + i);
+    if (el.style.display === 'none') continue;
+    el.querySelectorAll('.ident').forEach(n => n.remove());
+    const d = document.createElement('div');
+    d.className = 'ident';
+    d.textContent = i + 1;
+    el.appendChild(d);
+    setTimeout(() => d.classList.add('out'), 3500);
+    setTimeout(() => d.remove(), 4100);
+  }
+}
+
+// ---------- stall watchdog ----------
+// If a live/HLS video should be playing but its clock hasn't moved for 25s,
+// rebuild the slot (re-resolves Twitch/YouTube, fresh hls.js instance).
+const lastProgress = [{ t: -1, at: 0 }, { t: -1, at: 0 }, { t: -1, at: 0 }, { t: -1, at: 0 }];
+setInterval(() => {
+  if (!state || state.power === false || !state.playing) return;
+  for (let i = 0; i < 4; i++) {
+    const s = state.slots[i];
+    const el = document.getElementById('slot' + i);
+    const v = el && el.querySelector('video');
+    if (!v || s.paused || v.ended || el.style.display === 'none') { lastProgress[i] = { t: -1, at: Date.now() }; continue; }
+    const lp = lastProgress[i];
+    if (v.currentTime !== lp.t) { lastProgress[i] = { t: v.currentTime, at: Date.now() }; continue; }
+    if (Date.now() - lp.at > 25000) {
+      console.warn('[watchdog] slot', i, 'stalled — reloading');
+      lastProgress[i] = { t: -1, at: Date.now() };
+      setMsg(el, 'Reconnecting… (stream stalled)');
+      renderSlot(i, true);
+      applyAudioAndPlayback();
+    }
+  }
+}, 5000);
+
+function ytCmd(f, func, args) {
+  try {
+    f.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args: args || [] }), '*');
+  } catch {}
+}
+
+// "cover" fill mode for iframes: scale the 16:9 embed so it fills the slot (cropping edges)
+function layoutIframe(el, f, cover) {
+  if (!cover) {
+    f.style.position = ''; f.style.width = '100%'; f.style.height = '100%';
+    f.style.left = ''; f.style.top = '';
+    return;
+  }
+  const r = el.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  const ar = 16 / 9;
+  let w = r.width, h = r.width / ar;
+  if (h < r.height) { h = r.height; w = h * ar; }
+  f.style.position = 'absolute';
+  f.style.width = w + 'px'; f.style.height = h + 'px';
+  f.style.left = (r.width - w) / 2 + 'px';
+  f.style.top = (r.height - h) / 2 + 'px';
+}
+
+function applyAudioAndPlayback() {
+  if (!state) return;
+  state.slots.forEach((s, i) => {
+    const el = document.getElementById('slot' + i);
+    const vol = Math.max(0, Math.min(100, Number(s.volume) || 0));
+    el.classList.toggle('has-audio', vol > 0 && !!s.source);
+    const audioOn = soundOn && !state.muted && vol > 0;
+    const slotPlaying = state.playing && !s.paused;
+    const cover = s.fit === 'cover';
+    const v = el.querySelector('video');
+    if (v) {
+      v.volume = vol / 100;
+      v.muted = !audioOn;
+      v.style.objectFit = cover ? 'cover' : 'contain';
+      if (slotPlaying) {
+        const p = v.play();
+        if (p && p.catch) p.catch(() => {
+          if (audioOn && !v.muted) {
+            // Autoplay policy refused unmuted playback: keep the picture going
+            // muted, and show a badge so this never fails silently again.
+            v.muted = true;
+            v.play().catch(() => {});
+            soundBlockedHint(el, true);
+          }
+        });
+        if (audioOn) {
+          // if playback is running and unmuted, clear any stale badge
+          if (!v.muted && !v.paused) soundBlockedHint(el, false);
+        } else soundBlockedHint(el, false);
+      } else v.pause();
+    }
+    const anyFrame = el.querySelector('iframe');
+    if (anyFrame) layoutIframe(el, anyFrame, cover);
+    const f = el.querySelector('iframe[data-yt]');
+    if (f) {
+      ytCmd(f, audioOn ? 'unMute' : 'mute');
+      ytCmd(f, 'setVolume', [vol]);
+      ytCmd(f, slotPlaying ? 'playVideo' : 'pauseVideo');
+    }
+  });
+}
+// Small corner badge shown when the browser blocks sound (autoplay policy).
+// Fix: launch the TV browser with --autoplay-policy=no-user-gesture-required
+// (see README) or tap the screen once.
+function soundBlockedHint(el, on) {
+  let b = el.querySelector('.sndblk');
+  if (!on) { if (b) b.remove(); return; }
+  if (b) return;
+  b = document.createElement('div');
+  b.className = 'sndblk';
+  b.textContent = '🔇 sound blocked by browser — tap screen or launch with autoplay flag';
+  b.style.cssText = 'position:absolute;top:8px;right:8px;z-index:5;background:rgba(0,0,0,.75);' +
+    'color:#ffb04d;font:600 13px/1.4 system-ui;padding:6px 10px;border-radius:6px;pointer-events:none;max-width:60%';
+  el.appendChild(b);
+}
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(applyAudioAndPlayback, 200);
+});
+
+// ---------- standby ----------
+// Power off: tear down every player (stops all proxy/CDN traffic), kill widget
+// polling, show a black screen with a faint clock. The WebSocket stays
+// connected so the remote can wake the wall instantly.
+let standbyClock = null;
+function setStandby(on) {
+  let sb = document.getElementById('standby');
+  if (!on) {
+    if (sb) sb.remove();
+    clearInterval(standbyClock); standbyClock = null;
+    return;
+  }
+  for (let i = 0; i < 4; i++) { clearSlot(i); rendered[i] = null; }
+  widgetTimers.forEach(clearInterval); widgetTimers = [];
+  widgetsKey = null;
+  document.getElementById('widgets').innerHTML = '';
+  if (!sb) {
+    sb = document.createElement('div');
+    sb.id = 'standby';
+    sb.style.cssText = 'position:fixed;inset:0;z-index:50;background:#000';
+    sb.innerHTML =
+      '<div id="standbyBox" style="position:absolute;transform:translate(-50%,-50%);text-align:center;transition:left 2s,top 2s;font-family:system-ui,sans-serif">' +
+        '<div id="standbyTime" style="color:#2b2e3a;font:200 9vw system-ui;letter-spacing:-.02em;font-variant-numeric:tabular-nums"></div>' +
+        '<div id="standbyDate" style="color:#1f222c;font:500 1.6vw system-ui;letter-spacing:.08em;text-transform:uppercase;margin-top:-.5vw"></div>' +
+        '<div style="color:#1a1c24;font:600 .9vw system-ui;letter-spacing:.3em;margin-top:2vw">STREAMWALL · STANDBY</div>' +
+      '</div>';
+    document.body.appendChild(sb);
+  }
+  const tick = () => {
+    const el = document.getElementById('standbyTime');
+    if (!el) return;
+    const d = new Date();
+    el.textContent = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    document.getElementById('standbyDate').textContent = d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+    // drift slowly around the screen so nothing burns in
+    const box = document.getElementById('standbyBox');
+    box.style.left = (35 + Math.random() * 30) + '%';
+    box.style.top = (35 + Math.random() * 30) + '%';
+  };
+  tick();
+  if (!standbyClock) standbyClock = setInterval(tick, 20000);
+}
+
+function applyState() {
+  if (state.power === false) { setStandby(true); return; }
+  setStandby(false);
+  const wall = document.getElementById('wall');
+  wall.className = 'layout-' + state.layout;
+  const visible = VISIBLE[state.layout] || 1;
+  const free = state.layout === 'free';
+  for (let i = 0; i < 4; i++) {
+    const el = document.getElementById('slot' + i);
+    const show = free ? !!state.slots[i].source : i < visible;
+    el.style.display = show ? 'block' : 'none';
+    if (free && show) {
+      const r = (state.rects && state.rects[i]) || { x: 10, y: 10, w: 50, h: 50 };
+      el.style.left = r.x + '%'; el.style.top = r.y + '%';
+      el.style.width = r.w + '%'; el.style.height = r.h + '%';
+      el.style.zIndex = i + 1;
+    } else {
+      el.style.left = el.style.top = el.style.width = el.style.height = el.style.zIndex = '';
+    }
+    if (!show) { clearSlot(i); rendered[i] = null; continue; }
+    renderSlot(i);
+  }
+  applyAudioAndPlayback();
+  renderWidgets();
+}
+
+// ---------- widgets ----------
+let widgetsKey = null;
+let widgetTimers = [];
+function escW(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function renderWidgets() {
+  const ws = state.widgets || [];
+  const key = JSON.stringify(ws);
+  if (key === widgetsKey) return;
+  widgetsKey = key;
+  widgetTimers.forEach(clearInterval);
+  widgetTimers = [];
+  const layer = document.getElementById('widgets');
+  layer.innerHTML = '';
+  ws.forEach(w => {
+    const d = w.data || {};
+    const el = document.createElement('div');
+    el.className = 'widget ' + w.type;
+    el.style.left = (w.x || 50) + '%';
+    el.style.top = (w.y || 50) + '%';
+    if (w.type === 'text') {
+      el.innerHTML = (d.title ? '<div class="wt">' + escW(d.title) + '</div>' : '') +
+                     '<div class="wb">' + escW(d.body) + '</div>';
+    } else if (w.type === 'score') {
+      el.innerHTML = '<div class="row">' +
+        '<div class="team"><b>' + escW(d.teamA || 'Team A') + '</b><span>' + escW(d.scoreA || 0) + '</span></div>' +
+        '<div class="vs">VS</div>' +
+        '<div class="team"><b>' + escW(d.teamB || 'Team B') + '</b><span>' + escW(d.scoreB || 0) + '</span></div>' +
+        '</div>';
+    } else if (w.type === 'clock') {
+      el.innerHTML = '<div class="wb" data-clock>--:--</div>';
+    } else if (w.type === 'csplayer' || w.type === 'csteam' || w.type === 'csmatch' || w.type === 'csplayerlive') {
+      el.innerHTML = '<div class="wt">' + escW(d.name || 'Counter-Strike') + '</div><div data-cs>&#8230;</div>';
+      const body = el.querySelector('[data-cs]');
+      const ep = w.type === 'csplayer' ? 'player' : w.type === 'csteam' ? 'team' :
+                 w.type === 'csplayerlive' ? 'playerlive' : 'match';
+      const update = () => {
+        if (!d.slug) { body.textContent = 'Not configured — pick one on the remote'; return; }
+        fetch('/api/cs/' + ep + '/' + encodeURIComponent(d.slug))
+          .then(r => r.json())
+          .then(j => { body.innerHTML = j.error ? ('&#9888; ' + escW(j.error)) : renderCs(w.type, j); })
+          .catch(() => { body.textContent = '⚠ fetch failed'; });
+      };
+      update();
+      widgetTimers.push(setInterval(update, Math.max(10, Number(d.interval) || 30) * 1000));
+    } else if (w.type === 'custom') {
+      el.innerHTML = (d.title ? '<div class="wt">' + escW(d.title) + '</div>' : '') +
+                     '<div class="wb" data-custom>&#8230;</div>';
+      const body = el.querySelector('[data-custom]');
+      const update = () => fetchCustom(d, body);
+      update();
+      widgetTimers.push(setInterval(update, Math.max(5, Number(d.interval) || 30) * 1000));
+    } else if (w.type === 'pslive' || w.type === 'psticker' || w.type === 'pstournament') {
+      const titles = { pslive: '&#9679; LIVE CS2', psticker: '&#128197; UPCOMING CS2', pstournament: '&#127942; TOURNAMENTS' };
+      el.innerHTML = '<div class="wt">' + titles[w.type] + '</div><div data-ps>&#8230;</div>';
+      const body = el.querySelector('[data-ps]');
+      const ep = w.type === 'pslive' ? 'live' : w.type === 'psticker' ? 'upcoming' : 'tournaments';
+      const renderPS = j => {
+        if (j.error) { body.innerHTML = '&#9888; ' + escW(j.error); return; }
+        if (w.type === 'pslive') {
+          if (!j.matches || !j.matches.length) { body.innerHTML = '<div class="wl">No live matches right now</div>'; return; }
+          body.innerHTML = j.matches.slice(0, 4).map(m =>
+            '<div class="ps-match">' +
+              '<div class="ps-row">' +
+                '<span class="ps-team">' + escW(m.team1_short) + '</span>' +
+                '<span class="ps-score">' + (m.score1 !== null ? m.score1 : '?') + '</span>' +
+                '<span class="ps-sep">—</span>' +
+                '<span class="ps-score">' + (m.score2 !== null ? m.score2 : '?') + '</span>' +
+                '<span class="ps-team">' + escW(m.team2_short) + '</span>' +
+              '</div>' +
+              '<div class="ps-meta">' + escW(m.event) + (m.serie ? ' · ' + escW(m.serie) : '') + ' · BO' + (m.best_of || '?') + '</div>' +
+            '</div>'
+          ).join('');
+        } else if (w.type === 'psticker') {
+          if (!j.matches || !j.matches.length) { body.innerHTML = '<div class="wl">No upcoming matches</div>'; return; }
+          body.innerHTML = j.matches.slice(0, 6).map(m => {
+            let dt = '';
+            try { dt = new Date(m.begin_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }); } catch {}
+            return '<div class="tick-row">' +
+              '<span class="tick-teams">' + escW(m.team1) + ' vs ' + escW(m.team2) + '</span>' +
+              '<span class="tick-meta">' + escW(m.event) + ' · ' + escW(dt) + ' · BO' + (m.best_of || '?') + '</span>' +
+              '</div>';
+          }).join('');
+        } else {
+          if (!j.tournaments || !j.tournaments.length) { body.innerHTML = '<div class="wl">No active tournaments</div>'; return; }
+          body.innerHTML = j.tournaments.slice(0, 4).map(t => {
+            let dates = '';
+            try {
+              const s = new Date(t.begin_at).toLocaleDateString([], { month: 'short', day: 'numeric' });
+              const e2 = new Date(t.end_at).toLocaleDateString([], { month: 'short', day: 'numeric' });
+              dates = s + ' – ' + e2;
+            } catch {}
+            return '<div class="t-item">' +
+              '<div class="t-name">' + escW(t.name) + '</div>' +
+              '<div class="t-meta">' + escW(t.league) + (t.serie ? ' · ' + escW(t.serie) : '') + (dates ? ' · ' + dates : '') + '</div>' +
+              '</div>';
+          }).join('');
+        }
+      };
+      const updatePS = () => fetch('/api/ps/' + ep).then(r => r.json()).then(renderPS).catch(() => { body.textContent = '⚠ fetch failed'; });
+      updatePS();
+      widgetTimers.push(setInterval(updatePS, Math.max(15, Number(d.interval) || 60) * 1000));
+    }
+    layer.appendChild(el);
+  });
+  tickClock();
+}
+
+// Counter-Strike widget rendering (data from /api/cs/*)
+function csLine(k, v) { return '<div class="wl">' + escW(k) + ' ' + escW(v) + '</div>'; }
+function fmtTime(iso) {
+  try { return new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }); }
+  catch { return iso; }
+}
+function renderCs(type, j) {
+  if (type === 'csplayer') {
+    return '<div class="csbig">' + escW(j.nickname) + (j.rating != null ? ' <b>' + escW(j.rating) + '</b>' : '') + '</div>' +
+      csLine('Team:', j.team + (j.teamRank ? ' (#' + j.teamRank + ')' : '')) +
+      (j.rating != null ? csLine('Rating (6 mo):', j.rating) : '') +
+      (j.country ? csLine('Country:', j.country) : '');
+  }
+  if (type === 'csplayerlive') {
+    let h = '<div class="csbig">' + escW(j.nickname) + (j.team ? ' <span style="opacity:.6">(' + escW(j.team) + ')</span>' : '') + '</div>';
+    if (!j.match) return h + csLine('No live or upcoming match found.', '');
+    const m = j.match;
+    h += m.status === 'current'
+      ? '<div class="wl"><span class="live">&#9679; LIVE</span> vs ' + escW(m.vs) + ' · maps ' + escW(m.score) +
+        (m.live1 != null ? ' · map ' + escW(m.live1) + ':' + escW(m.live2 != null ? m.live2 : 0) : '') + '</div>'
+      : csLine('Next vs ' + m.vs + ':', fmtTime(m.start) + ' · BO' + m.bo);
+    if (j.stats) {
+      const s = j.stats;
+      const parts = [];
+      if (s.kills != null) parts.push('K ' + s.kills);
+      if (s.deaths != null) parts.push('D ' + s.deaths);
+      if (s.assists != null) parts.push('A ' + s.assists);
+      if (s.adr != null) parts.push('ADR ' + s.adr);
+      if (s.kast != null) parts.push('KAST ' + s.kast);
+      if (s.rating != null) parts.push('Rating ' + s.rating);
+      if (parts.length) h += '<div class="wl" style="font-size:1.45vw;font-weight:700">' + escW(parts.join(' · ')) + '</div>';
+    } else if (m.status === 'current') {
+      h += csLine(m.covered ? 'Player breakdown loading…' : 'No per-player feed for this match (not live-covered).', '');
+    }
+    return h;
+  }
+  if (type === 'csteam') {
+    let h = '<div class="csbig">' + escW(j.name) + (j.rank ? ' <b>#' + escW(j.rank) + '</b>' : '') + '</div>';
+    if (j.players && j.players.length) h += csLine('Roster:', j.players.join(', '));
+    if (j.next) {
+      h += j.next.status === 'current'
+        ? '<div class="wl"><span class="live">&#9679; LIVE</span> vs ' + escW(j.next.vs) + ' (' + escW(j.next.score) + ')</div>'
+        : csLine('Next vs ' + j.next.vs + ':', fmtTime(j.next.start));
+    }
+    return h;
+  }
+  // csmatch
+  const live = j.status === 'current';
+  const cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+  const sideAbbr = s => s === 'TERRORIST' ? 'T' : (s || '');
+  let h = '<div class="csbig">' + escW(j.team1.name) + ' <b>' + escW(j.team1.score) + ':' + escW(j.team2.score) + '</b> ' + escW(j.team2.name) + '</div>';
+  const L = j.live;
+  if (live && L && L.t1 && L.t2) {
+    // current map: name, round score, round number + sides + economy
+    h += '<div class="wl" style="font-size:1.45vw;font-weight:700">' +
+      escW(cap(L.map) || 'Map') + ' ' + escW(L.t1.score) + ':' + escW(L.t2.score) +
+      (L.round ? ' <span style="opacity:.65">· round ' + escW(L.round) + '</span>' : '') + '</div>';
+    h += csLine('Sides:', sideAbbr(L.t1.side) + ' vs ' + sideAbbr(L.t2.side));
+    if (L.t1.eq != null || L.t2.eq != null) {
+      h += csLine('Equipment:', '$' + (L.t1.eq || 0) + ' vs $' + (L.t2.eq || 0));
+    }
+    if (L.phase) {
+      h += csLine('Round:', L.gameEnded ? 'map finished' : String(L.phase).replace(/_/g, ' ').toLowerCase());
+    }
+  } else if (live && (j.live1 != null || j.live2 != null)) {
+    h += csLine('Current map:', (j.live1 != null ? j.live1 : 0) + ':' + (j.live2 != null ? j.live2 : 0));
+  }
+  if (j.maps && j.maps.length) {
+    h += csLine('Maps:', j.maps.map(g => g.map + (g.status === 'finished' ? ' ✓' : g.status === 'current' ? ' ●' : '')).join(', '));
+  }
+  (j.games || []).forEach((g, i) => {
+    if (g.score && g.score !== '–:–') h += csLine((g.map || 'Map ' + (i + 1)) + ':', g.score);
+  });
+  h += live
+    ? '<div class="wl"><span class="live">&#9679; LIVE</span> · BO' + escW(j.bo) + '</div>'
+    : csLine(j.status === 'upcoming' ? 'Starts:' : 'Status:', (j.status === 'upcoming' ? fmtTime(j.start) : j.status) + ' · BO' + j.bo);
+  return h;
+}
+
+// custom widget data: fetched via the server proxy, rendered with {{path}} templates
+function getPath(obj, path) {
+  return path.split(/[.\[\]]+/).filter(Boolean)
+    .reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+function fetchCustom(d, body) {
+  if (!d.url) { body.textContent = 'No data URL set'; return; }
+  fetch('/api/proxy?url=' + encodeURIComponent(d.url))
+    .then(r => r.text())
+    .then(text => {
+      let data = null;
+      try { data = JSON.parse(text); } catch {}
+      const tpl = d.template || '{{.}}';
+      body.textContent = tpl.replace(/\{\{([^}]*)\}\}/g, (_, p) => {
+        p = p.trim();
+        if (p === '.') return data != null && typeof data !== 'object' ? String(data) : text.slice(0, 500);
+        if (data == null) return '?';
+        const v = getPath(data, p);
+        return v == null ? '?' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+      });
+    })
+    .catch(() => { body.textContent = '⚠ fetch failed'; });
+}
+function tickClock() {
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  document.querySelectorAll('[data-clock]').forEach(el => { el.textContent = hh + ':' + mm; });
+}
+setInterval(tickClock, 5000);
+
+// ---------- websocket ----------
+function connect() {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => {
+    document.getElementById('connDot').classList.add('ok');
+    ws.send(JSON.stringify({ type: 'hello', role: 'tv' })); // lets the remote know a display is up
+  };
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'state') { state = msg.state; applyState(); }
+    else if (msg.type === 'cmd' && msg.action === 'reload' && typeof msg.slot === 'number') {
+      if (state && state.power === false) return;
+      renderSlot(msg.slot, true);
+      applyAudioAndPlayback();
+    }
+    else if (msg.type === 'cmd' && msg.action === 'identify') {
+      if (state && state.power !== false) identify();
+    }
+  };
+  ws.onclose = () => {
+    document.getElementById('connDot').classList.remove('ok');
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script>
+</body>
+</html>
